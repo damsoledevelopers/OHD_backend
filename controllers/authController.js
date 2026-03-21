@@ -3,6 +3,18 @@ const { hashPassword, comparePassword } = require('../utils/password');
 const { generateToken } = require('../utils/jwt');
 const connectDB = require('../config/database');
 
+/** Cross-origin SPA (e.g. Vercel → Render) needs SameSite=None; Lax cookies are often dropped on XHR. */
+function authCookieOptions() {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+    maxAge: 60 * 60 * 24 * 7 * 1000,
+    path: '/',
+  };
+}
+
 async function signup(req, res) {
   try {
     await connectDB();
@@ -42,17 +54,11 @@ async function signup(req, res) {
       role: user.role,
     });
 
-    // Set HTTP-only cookie
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 60 * 60 * 24 * 7 * 1000, // 7 days
-      path: '/',
-    });
+    res.cookie('token', token, authCookieOptions());
 
     return res.status(201).json({
       message: 'Super admin created successfully',
+      token,
       user: {
         id: user._id,
         email: user.email,
@@ -105,18 +111,12 @@ async function login(req, res) {
     });
 
     console.log('Token generated successfully');
-    // Set HTTP-only cookie
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 60 * 60 * 24 * 7 * 1000, // 7 days
-      path: '/',
-    });
+    res.cookie('token', token, authCookieOptions());
 
     console.log('Login successful for:', email);
     return res.json({
       message: 'Login successful',
+      token,
       user: {
         id: user._id,
         email: user.email,
@@ -135,14 +135,7 @@ async function login(req, res) {
 
 async function logout(req, res) {
   try {
-    // Clear the token cookie
-    res.cookie('token', '', {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 0,
-      path: '/',
-    });
+    res.cookie('token', '', { ...authCookieOptions(), maxAge: 0 });
 
     return res.json({ message: 'Logout successful' });
   } catch (error) {
