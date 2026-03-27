@@ -105,10 +105,157 @@ async function questionIdsForSections(sectionIds) {
   return set.size ? set : null;
 }
 
-const ratingToNumber = (rating) => {
-  const map = { A: 5, B: 4, C: 3, D: 2, E: 1 };
-  return map[rating] || 0;
-};
+function makeEmptyRatingCount() {
+  return { A: 0, B: 0, C: 0, D: 0, E: 0 };
+}
+const VALID_RATINGS = new Set(['A', 'B', 'C', 'D', 'E']);
+
+function getOriBenchmark(overallPercentage) {
+  if (overallPercentage >= 90) {
+    return {
+      band: '90-100',
+      healthStatus: 'Operationally Secure & Governance Mature',
+      colorCode: 'Green',
+      colorHex: '#10b981',
+      minScore: 90,
+    };
+  }
+  if (overallPercentage >= 80) {
+    return {
+      band: '80-89.9',
+      healthStatus: 'Stable - Continuous Monitoring Required',
+      colorCode: 'Blue',
+      colorHex: '#3b82f6',
+      minScore: 80,
+    };
+  }
+  if (overallPercentage >= 70) {
+    return {
+      band: '70-79.9',
+      healthStatus: 'Structural Stability Weakening - Corrective Action Required',
+      colorCode: 'Yellow',
+      colorHex: '#eab308',
+      minScore: 70,
+    };
+  }
+  if (overallPercentage >= 60) {
+    return {
+      band: '60-69.9',
+      healthStatus: 'High Risk Operational Zone - War Room Activation Required',
+      colorCode: 'Orange',
+      colorHex: '#f97316',
+      minScore: 60,
+    };
+  }
+  return {
+    band: 'Below 60',
+    healthStatus: 'SOS - Critical Organizational Distress',
+    colorCode: 'Red',
+    colorHex: '#ef4444',
+    minScore: 0,
+  };
+}
+
+function toQuestionId(value) {
+  if (!value) return '';
+  return value.toString();
+}
+
+function collectQuestionAggregates(responses, allowedQ = null) {
+  const byQuestion = new Map();
+  let scopedResponseCount = 0;
+
+  responses.forEach((response) => {
+    const responseId = toQuestionId(response._id);
+    const seenInResponse = new Set();
+    let contributed = false;
+
+    response.answers.forEach((answer) => {
+      const qid = toQuestionId(answer.questionId);
+      if (!qid) return;
+      if (allowedQ && !allowedQ.has(qid)) return;
+      if (!VALID_RATINGS.has(answer.rating)) return;
+      if (seenInResponse.has(qid)) return;
+      seenInResponse.add(qid);
+
+      if (!byQuestion.has(qid)) {
+        byQuestion.set(qid, {
+          ratingCount: makeEmptyRatingCount(),
+          responders: new Set(),
+        });
+      }
+
+      const entry = byQuestion.get(qid);
+      entry.ratingCount[answer.rating] += 1;
+      entry.responders.add(responseId);
+      contributed = true;
+    });
+
+    if (contributed) scopedResponseCount += 1;
+  });
+
+  return { byQuestion, scopedResponseCount };
+}
+
+function buildQuestionStatsFromAggregate(sectionQuestions, aggregateByQuestion) {
+  const questionStats = [];
+
+  sectionQuestions.forEach((question) => {
+    const qid = toQuestionId(question._id);
+    const entry = aggregateByQuestion.get(qid);
+    const ratingCount = entry ? entry.ratingCount : makeEmptyRatingCount();
+    const total = entry ? entry.responders.size : 0;
+    const ratingPercentage = {
+      A: total > 0 ? (ratingCount.A / total) * 100 : 0,
+      B: total > 0 ? (ratingCount.B / total) * 100 : 0,
+      C: total > 0 ? (ratingCount.C / total) * 100 : 0,
+      D: total > 0 ? (ratingCount.D / total) * 100 : 0,
+      E: total > 0 ? (ratingCount.E / total) * 100 : 0,
+    };
+
+    questionStats.push({
+      questionId: qid,
+      questionText: question && question.text ? question.text : '',
+      ratingCount,
+      ratingPercentage,
+      totalResponses: total,
+    });
+  });
+
+  return questionStats;
+}
+
+function computeSectionSummary(questionStats, sectionQuestions, aggregateByQuestion) {
+  let totalScore = 0;
+  let totalMaxScore = 0;
+  const sectionResponders = new Set();
+
+  questionStats.forEach((qStats) => {
+    const qTotal = qStats.totalResponses;
+    if (qTotal > 0) {
+      const weightedScore =
+        qStats.ratingCount.A * 5 +
+        qStats.ratingCount.B * 4 +
+        qStats.ratingCount.C * 3 +
+        qStats.ratingCount.D * 2 +
+        qStats.ratingCount.E * 1;
+      totalScore += weightedScore;
+      totalMaxScore += qTotal * 5;
+    }
+  });
+
+  sectionQuestions.forEach((question) => {
+    const qid = toQuestionId(question._id);
+    const entry = aggregateByQuestion.get(qid);
+    if (!entry) return;
+    entry.responders.forEach((id) => sectionResponders.add(id));
+  });
+
+  return {
+    sectionPercentage: totalMaxScore > 0 ? (totalScore / totalMaxScore) * 100 : 0,
+    totalResponses: sectionResponders.size,
+  };
+}
 
 async function calculateQuestionStats(questionId, companyId, filters = {}) {
   const questionPaper = await getPublishedQuestionPaper();
@@ -149,47 +296,31 @@ async function calculateQuestionStats(questionId, companyId, filters = {}) {
 async function calculateSectionStats(sectionId, companyId, filters = {}) {
   const questionPaper = await getPublishedQuestionPaper();
   const { section } = findSectionById(questionPaper, sectionId);
-  const questionStats = [];
 
   if (!section || !Array.isArray(section.questions)) {
     return {
       sectionId: sectionId.toString(),
       sectionName: section && section.name ? section.name : '',
-      questionStats,
+      questionStats: [],
       sectionPercentage: 0,
       totalResponses: 0,
     };
   }
 
+  const responses = await EmployeeResponse.find(buildResponseMatch(companyId, filters));
   const questions = [...section.questions].sort((a, b) => {
     const ao = typeof a.order === 'number' ? a.order : 0;
     const bo = typeof b.order === 'number' ? b.order : 0;
     return ao - bo;
   });
-
-  for (const question of questions) {
-    const stats = await calculateQuestionStats(question._id, companyId, filters);
-    questionStats.push(stats);
-  }
-
-  let totalScore = 0;
-  let totalMaxScore = 0;
-
-  questionStats.forEach(qStats => {
-    const qTotal = qStats.totalResponses;
-    if (qTotal > 0) {
-      const weightedScore =
-        (qStats.ratingCount.A * 5 +
-          qStats.ratingCount.B * 4 +
-          qStats.ratingCount.C * 3 +
-          qStats.ratingCount.D * 2 +
-          qStats.ratingCount.E * 1);
-      totalScore += weightedScore;
-      totalMaxScore += qTotal * 5;
-    }
-  });
-
-  const sectionPercentage = totalMaxScore > 0 ? (totalScore / totalMaxScore) * 100 : 0;
+  const allowedQ = new Set(questions.map((q) => toQuestionId(q._id)));
+  const { byQuestion } = collectQuestionAggregates(responses, allowedQ);
+  const questionStats = buildQuestionStatsFromAggregate(questions, byQuestion);
+  const { sectionPercentage, totalResponses } = computeSectionSummary(
+    questionStats,
+    questions,
+    byQuestion
+  );
   const sectionName = section && section.name ? section.name : '';
 
   return {
@@ -197,7 +328,7 @@ async function calculateSectionStats(sectionId, companyId, filters = {}) {
     sectionName,
     questionStats,
     sectionPercentage,
-    totalResponses: questionStats.length > 0 ? questionStats[0].totalResponses : 0,
+    totalResponses,
   };
 }
 
@@ -286,20 +417,14 @@ async function calculateOverallStats(companyId, filters = {}, restrictedSectionI
   const sectionsWithPillars = getAllSections(questionPaper);
 
   const allowedQ = await questionIdsForSections(restrictedSectionIds);
-
-  const ratingCount = { A: 0, B: 0, C: 0, D: 0, E: 0 };
-  let scopedResponseCount = 0;
-
-  responses.forEach(response => {
-    let contributed = false;
-    response.answers.forEach(answer => {
-      if (allowedQ && !allowedQ.has(answer.questionId.toString())) return;
-      if (ratingCount.hasOwnProperty(answer.rating)) {
-        ratingCount[answer.rating]++;
-        contributed = true;
-      }
-    });
-    if (contributed) scopedResponseCount += 1;
+  const { byQuestion, scopedResponseCount } = collectQuestionAggregates(responses, allowedQ);
+  const ratingCount = makeEmptyRatingCount();
+  byQuestion.forEach((entry) => {
+    ratingCount.A += entry.ratingCount.A;
+    ratingCount.B += entry.ratingCount.B;
+    ratingCount.C += entry.ratingCount.C;
+    ratingCount.D += entry.ratingCount.D;
+    ratingCount.E += entry.ratingCount.E;
   });
 
   const totalRatings = Object.values(ratingCount).reduce((a, b) => a + b, 0);
@@ -314,12 +439,20 @@ async function calculateOverallStats(companyId, filters = {}, restrictedSectionI
   let totalScore = 0;
   let totalMaxScore = 0;
 
-  responses.forEach(response => {
-    response.answers.forEach(answer => {
-      if (allowedQ && !allowedQ.has(answer.questionId.toString())) return;
-      totalScore += ratingToNumber(answer.rating);
-      totalMaxScore += 5;
-    });
+  byQuestion.forEach((entry) => {
+    totalScore +=
+      entry.ratingCount.A * 5 +
+      entry.ratingCount.B * 4 +
+      entry.ratingCount.C * 3 +
+      entry.ratingCount.D * 2 +
+      entry.ratingCount.E * 1;
+    totalMaxScore +=
+      (entry.ratingCount.A +
+        entry.ratingCount.B +
+        entry.ratingCount.C +
+        entry.ratingCount.D +
+        entry.ratingCount.E) *
+      5;
   });
 
   const overallPercentage = totalMaxScore > 0 ? (totalScore / totalMaxScore) * 100 : 0;
@@ -334,25 +467,32 @@ async function calculateOverallStats(companyId, filters = {}, restrictedSectionI
   let bestPercentage = 0;
 
   for (const { section } of sectionsToScore) {
-    const sectionStats = await calculateSectionStats(section._id.toString(), companyId, filters);
-    if (sectionStats.sectionPercentage > bestPercentage) {
-      bestPercentage = sectionStats.sectionPercentage;
+    const sectionQuestions = Array.isArray(section.questions)
+      ? [...section.questions].sort((a, b) => {
+          const ao = typeof a.order === 'number' ? a.order : 0;
+          const bo = typeof b.order === 'number' ? b.order : 0;
+          return ao - bo;
+        })
+      : [];
+    const questionStats = buildQuestionStatsFromAggregate(sectionQuestions, byQuestion);
+    const { sectionPercentage } = computeSectionSummary(
+      questionStats,
+      sectionQuestions,
+      byQuestion
+    );
+    if (sectionPercentage > bestPercentage) {
+      bestPercentage = sectionPercentage;
       bestSection = {
         sectionId: section._id.toString(),
         sectionName: section.name,
-        percentage: sectionStats.sectionPercentage,
+        percentage: sectionPercentage,
       };
     }
   }
 
   const summaryInsights = [];
-  if (overallPercentage >= 80) {
-    summaryInsights.push('Organization health is excellent');
-  } else if (overallPercentage >= 60) {
-    summaryInsights.push('Organization health is good with room for improvement');
-  } else {
-    summaryInsights.push('Organization health needs attention');
-  }
+  const benchmark = getOriBenchmark(overallPercentage);
+  summaryInsights.push(`ORI Benchmark: ${benchmark.healthStatus} (${benchmark.colorCode})`);
 
   const uniqueCompanies = companyId
     ? 1
@@ -366,6 +506,7 @@ async function calculateOverallStats(companyId, filters = {}, restrictedSectionI
     totalResponses: scopedResponseCount,
     totalCompanies: uniqueCompanies,
     summaryInsights,
+    benchmark,
   };
 }
 

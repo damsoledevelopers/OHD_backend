@@ -50,7 +50,7 @@ export async function exportPDF(request: NextRequest, { params }: { params: { co
     doc.text(`  A: ${overallStats.ratingDistribution.A} (${overallStats.ratingDistributionPercentage.A.toFixed(2)}%)`);
     doc.text(`  B: ${overallStats.ratingDistribution.B} (${overallStats.ratingDistributionPercentage.B.toFixed(2)}%)`);
     doc.text(`  C: ${overallStats.ratingDistribution.C} (${overallStats.ratingDistributionPercentage.C.toFixed(2)}%)`);
-    doc.text(`  D: ${overallStats.ratingDistribution.D} (${overallStats.ratingDistribution.D.toFixed(2)}%)`);
+    doc.text(`  D: ${overallStats.ratingDistribution.D} (${overallStats.ratingDistributionPercentage.D.toFixed(2)}%)`);
     doc.text(`  E: ${overallStats.ratingDistribution.E} (${overallStats.ratingDistribution.E.toFixed(2)}%)`);
     doc.moveDown();
 

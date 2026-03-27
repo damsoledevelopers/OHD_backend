@@ -8,7 +8,7 @@ const MailLogSchema = new mongoose.Schema(
     notes: { type: String, default: '' },
     status: {
       type: String,
-      enum: ['sent', 'failed'],
+      enum: ['sent', 'partial', 'failed'],
       default: 'sent',
     },
     providerMessageId: { type: String, default: null },

@@ -1,8 +1,75 @@
 const EmployeeResponse = require('../models/EmployeeResponse');
 const Company = require('../models/Company');
+const MailLog = require('../models/MailLog');
 const connectDB = require('../config/database');
 const axios = require('axios');
 const XLSX = require('xlsx');
+
+async function extractInvitedEmailsFromExcelUrl(excelFileUrl) {
+  if (!excelFileUrl || typeof excelFileUrl !== 'string') return [];
+
+  const response = await axios.get(excelFileUrl, { responseType: 'arraybuffer' });
+  const buffer = Buffer.from(response.data);
+  const urlLower = excelFileUrl.toLowerCase();
+
+  let fileName = 'file.xlsx';
+  if (urlLower.includes('?')) {
+    const base = urlLower.split('?')[0];
+    fileName = base.substring(base.lastIndexOf('/') + 1) || fileName;
+  } else {
+    fileName = urlLower.substring(urlLower.lastIndexOf('/') + 1) || fileName;
+  }
+
+  const emails = [];
+
+  if (fileName.endsWith('.csv')) {
+    const text = buffer.toString('utf-8');
+    const lines = text.split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const columns = line.split(',').map((col) => col.trim().replace(/^"|"$/g, ''));
+      for (const col of columns) {
+        if (col.includes('@') && col.includes('.')) {
+          emails.push(col.toLowerCase());
+          break;
+        }
+      }
+    }
+  } else {
+    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+    let emailColumnIndex = -1;
+    if (data.length > 0) {
+      const headerRow = data[0];
+      emailColumnIndex = headerRow.findIndex(
+        (cell) =>
+          cell &&
+          (cell.toString().toLowerCase().includes('email') ||
+            cell.toString().toLowerCase().includes('mail'))
+      );
+    }
+
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      if (emailColumnIndex >= 0 && row[emailColumnIndex]) {
+        const email = row[emailColumnIndex].toString().trim().toLowerCase();
+        if (email.includes('@') && email.includes('.')) emails.push(email);
+      } else {
+        for (const cell of row) {
+          if (cell && cell.toString().includes('@') && cell.toString().includes('.')) {
+            emails.push(cell.toString().trim().toLowerCase());
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  return [...new Set(emails)];
+}
 
 async function submitResponse(req, res) {
   try {
@@ -55,18 +122,22 @@ async function submitResponse(req, res) {
       }
     }
 
-    // Check if employee already submitted (only when email is provided)
-    if (employeeEmail) {
-      const existingResponse = await EmployeeResponse.findOne({ companyId, employeeEmail: employeeEmail.trim().toLowerCase() });
-      if (existingResponse) {
-        return res.status(400).json({ error: 'Response already submitted for this email' });
-      }
+    const normalizedEmail = String(employeeEmail || '').trim().toLowerCase();
+    const hasValidEmail = normalizedEmail.includes('@') && normalizedEmail.includes('.');
+    if (!hasValidEmail) {
+      return res.status(400).json({ error: 'A valid employeeEmail is required' });
+    }
+
+    // Enforce one submission per employee email per company.
+    const existingResponse = await EmployeeResponse.findOne({ companyId, employeeEmail: normalizedEmail });
+    if (existingResponse) {
+      return res.status(400).json({ error: 'Response already submitted for this email' });
     }
 
     const response = await EmployeeResponse.create({
       companyId,
       service,
-      employeeEmail: employeeEmail ? employeeEmail.trim().toLowerCase() : undefined,
+      employeeEmail: normalizedEmail,
       employeeName,
       department: department ? department.trim() : undefined,
       answers,
@@ -110,92 +181,45 @@ async function getCompanyResponseSummary(req, res) {
       return res.status(404).json({ error: 'Company not found' });
     }
 
-    // Load invited emails from the company's Excel file (if available)
-    let invitedEmails = [];
-    const departmentsFromExcel = new Set();
-    if (company.excelFileUrl) {
-      try {
-        const response = await axios.get(company.excelFileUrl, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(response.data);
-
-        // Try to infer a file name / extension from the URL
-        const urlLower = company.excelFileUrl.toLowerCase();
-        let fileName = 'file.xlsx';
-        if (urlLower.includes('?')) {
-          const base = urlLower.split('?')[0];
-          fileName = base.substring(base.lastIndexOf('/') + 1) || fileName;
-        } else {
-          fileName = urlLower.substring(urlLower.lastIndexOf('/') + 1) || fileName;
-        }
-
-        if (fileName.endsWith('.csv')) {
-          const text = buffer.toString('utf-8');
-          const lines = text.split('\n');
-
-          for (const line of lines) {
-            if (line.trim()) {
-              const columns = line.split(',').map((col) => col.trim().replace(/^"|"$/g, ''));
-              for (const col of columns) {
-                if (col.includes('@') && col.includes('.')) {
-                  invitedEmails.push(col.toLowerCase());
-                  break;
-                }
-              }
-            }
-          }
-        } else {
-          const workbook = XLSX.read(buffer, { type: 'buffer' });
-          const sheetName = workbook.SheetNames[0];
-          const worksheet = workbook.Sheets[sheetName];
-          const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-
-          let emailColumnIndex = -1;
-          let deptColumnIndex = -1;
-          if (data.length > 0) {
-            const headerRow = data[0];
-            emailColumnIndex = headerRow.findIndex(
-              (cell) =>
-                cell &&
-                (cell.toString().toLowerCase().includes('email') ||
-                  cell.toString().toLowerCase().includes('mail'))
-            );
-            deptColumnIndex = headerRow.findIndex(
-              (cell) =>
-                cell &&
-                /department|dept\.?|division|team/i.test(cell.toString())
-            );
-          }
-
-          for (let i = 1; i < data.length; i++) {
-            const row = data[i];
-            if (deptColumnIndex >= 0 && row[deptColumnIndex]) {
-              const d = row[deptColumnIndex].toString().trim();
-              if (d) departmentsFromExcel.add(d);
-            }
-            if (emailColumnIndex >= 0 && row[emailColumnIndex]) {
-              const email = row[emailColumnIndex].toString().trim().toLowerCase();
-              if (email.includes('@') && email.includes('.')) {
-                invitedEmails.push(email);
-              }
-            } else {
-              for (const cell of row) {
-                if (cell && cell.toString().includes('@') && cell.toString().includes('.')) {
-                  invitedEmails.push(cell.toString().trim().toLowerCase());
-                  break;
-                }
-              }
-            }
-          }
-        }
-      } catch (error) {
-        // If Excel parsing fails, continue with zero invited emails rather than failing the request.
-        console.error('Failed to parse company Excel for summary', error.message || error);
+    // Preferred source for invited users: recipients from survey email logs.
+    const mailLogs = await MailLog.find({ companyId }).select('recipients status').lean();
+    const invitedSet = new Set();
+    for (const log of mailLogs) {
+      if (log?.status === 'failed') continue;
+      const recipients = Array.isArray(log?.recipients) ? log.recipients : [];
+      for (const raw of recipients) {
+        const email = String(raw || '').trim().toLowerCase();
+        if (email && email.includes('@') && email.includes('.')) invitedSet.add(email);
       }
     }
-
-    invitedEmails = [...new Set(invitedEmails)];
+    let invitedSource = 'mail_logs';
+    // Fallback for legacy rows / failed mail-log inserts: parse from company Excel.
+    if (invitedSet.size === 0 && company.excelFileUrl) {
+      try {
+        const excelInvites = await extractInvitedEmailsFromExcelUrl(company.excelFileUrl);
+        excelInvites.forEach((e) => invitedSet.add(e));
+        if (excelInvites.length > 0) invitedSource = 'company_excel';
+      } catch (e) {
+        invitedSource = 'none';
+      }
+    }
+    const invitedEmails = [...invitedSet];
 
     const responses = await EmployeeResponse.find({ companyId });
+
+    const companyDepartments = Array.isArray(company.departments) ? company.departments : [];
+    const allowsDesignDepartment = companyDepartments.some(
+      (d) => String(d || '').trim().toLowerCase() === 'design'
+    );
+
+    // Legacy cleanup: remove stale hardcoded "Design" responses when this company
+    // does not explicitly use Design as a configured department.
+    if (!allowsDesignDepartment) {
+      await EmployeeResponse.updateMany(
+        { companyId, department: { $regex: /^design$/i } },
+        { $unset: { department: '' } }
+      );
+    }
 
     const completedEmailsSet = new Set(
       responses
@@ -204,16 +228,27 @@ async function getCompanyResponseSummary(req, res) {
     );
 
     const completedEmails = [...completedEmailsSet];
+    const completedUsers = responses.map((r, index) => {
+      const email = String(r.employeeEmail || '').trim().toLowerCase();
+      if (email && email.includes('@') && email.includes('.')) return email;
+      const name = String(r.employeeName || '').trim();
+      if (name) return name;
+      return `Anonymous submission ${index + 1}`;
+    });
     const pendingEmails = invitedEmails.filter((email) => !completedEmailsSet.has(email));
 
     const totalInvited = invitedEmails.length;
-    const completedCount = completedEmails.length || responses.length;
-    const pendingCount = totalInvited > 0 ? Math.max(totalInvited - completedCount, 0) : 0;
+    const completedCount = responses.length;
+    const pendingCount = totalInvited > 0 ? Math.max(totalInvited - completedEmails.length, 0) : 0;
 
     // Simple department-level breakdown based on submitted responses
     const departmentBreakdown = {};
     for (const r of responses) {
-      const dept = (r.department || 'Unknown').trim() || 'Unknown';
+      const rawDept = (r.department || '').trim();
+      const dept =
+        !allowsDesignDepartment && rawDept.toLowerCase() === 'design'
+          ? 'Unknown'
+          : rawDept || 'Unknown';
       if (!departmentBreakdown[dept]) {
         departmentBreakdown[dept] = { responses: 0 };
       }
@@ -221,9 +256,8 @@ async function getCompanyResponseSummary(req, res) {
     }
 
     // Start from any departments explicitly configured for this company, then
-    // merge in departments inferred from the Excel file and from submitted responses.
-    const departmentOptions = new Set(Array.isArray(company.departments) ? company.departments : []);
-    for (const d of departmentsFromExcel) departmentOptions.add(d);
+    // merge in departments from submitted responses.
+    const departmentOptions = new Set(companyDepartments);
     Object.keys(departmentBreakdown).forEach((d) => departmentOptions.add(d));
     const departments = [...departmentOptions].filter(Boolean).sort((a, b) =>
       a.localeCompare(b, undefined, { sensitivity: 'base' })
@@ -245,11 +279,13 @@ async function getCompanyResponseSummary(req, res) {
       completedCount,
       pendingCount,
       completedEmails,
+      completedUsers,
       pendingEmails,
       invitedEmails,
       departmentBreakdown,
       departments,
       totalResponses: responses.length,
+      invitedSource,
       surveyStatus: company.surveyStatus,
       surveyDispatchedAt: company.surveyDispatchedAt,
       surveyClosesAt: company.surveyClosesAt,
@@ -258,6 +294,90 @@ async function getCompanyResponseSummary(req, res) {
     return res
       .status(500)
       .json({ error: error.message || 'Failed to build company response summary' });
+  }
+}
+
+async function backfillMissingResponseEmails(req, res) {
+  try {
+    await connectDB();
+
+    const companyId = req.params.companyId;
+    const dryRun = String(req.query.dryRun || 'false').toLowerCase() === 'true';
+
+    const company = await Company.findById(companyId);
+    if (!company) {
+      return res.status(404).json({ error: 'Company not found' });
+    }
+
+    const mailLogs = await MailLog.find({ companyId }).select('recipients status').lean();
+    const invitedSet = new Set();
+    for (const log of mailLogs) {
+      if (log?.status === 'failed') continue;
+      const recipients = Array.isArray(log?.recipients) ? log.recipients : [];
+      for (const raw of recipients) {
+        const email = String(raw || '').trim().toLowerCase();
+        if (email && email.includes('@') && email.includes('.')) invitedSet.add(email);
+      }
+    }
+    if (invitedSet.size === 0 && company.excelFileUrl) {
+      try {
+        const excelInvites = await extractInvitedEmailsFromExcelUrl(company.excelFileUrl);
+        excelInvites.forEach((e) => invitedSet.add(e));
+      } catch (e) {
+        // Keep an empty invited list if Excel parsing fails.
+      }
+    }
+    const invitedEmails = [...invitedSet];
+
+    const responses = await EmployeeResponse.find({ companyId }).sort({ submittedAt: 1, _id: 1 });
+
+    const completedSet = new Set(
+      responses
+        .map((r) => String(r.employeeEmail || '').trim().toLowerCase())
+        .filter((e) => e && e.includes('@') && e.includes('.'))
+    );
+
+    const missing = responses.filter((r) => {
+      const email = String(r.employeeEmail || '').trim().toLowerCase();
+      return !(email && email.includes('@') && email.includes('.'));
+    });
+    const unmatchedInvited = invitedEmails.filter((email) => !completedSet.has(email));
+
+    const updates = [];
+    // Conservative backfill to avoid assigning a wrong email:
+    // only when there is a single clear candidate on both sides.
+    if (missing.length === 1 && unmatchedInvited.length === 1) {
+      updates.push({
+        responseId: String(missing[0]._id),
+        assignEmail: unmatchedInvited[0],
+      });
+    }
+
+    if (!dryRun && updates.length > 0) {
+      await EmployeeResponse.updateOne(
+        { _id: updates[0].responseId },
+        { $set: { employeeEmail: updates[0].assignEmail } }
+      );
+    }
+
+    return res.json({
+      companyId,
+      dryRun,
+      invitedCount: invitedEmails.length,
+      existingCompletedEmailCount: completedSet.size,
+      missingEmailResponseCount: missing.length,
+      unmatchedInvitedEmailCount: unmatchedInvited.length,
+      updatedCount: updates.length,
+      updates,
+      note:
+        updates.length === 0
+          ? 'No unambiguous backfill candidate found. Manual mapping is required for safety.'
+          : dryRun
+            ? 'Dry run only. Re-run without dryRun to apply.'
+            : 'Backfill applied.',
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to backfill response emails' });
   }
 }
 
@@ -305,6 +425,7 @@ module.exports = {
   submitResponse,
   getCompanyResponses,
   getCompanyResponseSummary,
+  backfillMissingResponseEmails,
   getCompaniesWithResponses,
 };
 

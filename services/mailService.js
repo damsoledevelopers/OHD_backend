@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const RECIPIENT_EMAIL_TOKEN = '__RECIPIENT_EMAIL__';
 
 let transporter = null;
 
@@ -40,13 +41,17 @@ async function sendBulkEmail({ subject, html, recipients }) {
 
     const recipient = rawRecipient.trim();
     if (!recipient) continue;
+    const recipientHtml =
+      typeof html === 'string' && html.includes(RECIPIENT_EMAIL_TOKEN)
+        ? html.split(RECIPIENT_EMAIL_TOKEN).join(encodeURIComponent(recipient))
+        : html;
 
     try {
       const info = await transport.sendMail({
         from,
         to: recipient,
         subject,
-        html,
+        html: recipientHtml,
       });
 
       results.push({
