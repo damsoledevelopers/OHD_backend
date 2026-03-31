@@ -164,7 +164,20 @@ async function buildDefaultSurveyInviteHtml({ surveyLink, companyId }) {
                 </a>
               </div>`;
 
-  return `
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    /* Makes the submit button visually and functionally inactive until the required department field is filled/selected */
+    #ohd-dept-field:invalid ~ div button[type="submit"] {
+      opacity: 0.5 !important;
+      cursor: not-allowed !important;
+      pointer-events: none !important;
+    }
+  </style>
+</head>
+<body style="margin: 0; padding: 0;">
         <div style="font-family: Arial, sans-serif; background-color: #f6f7fb; padding: 24px;">
           <div style="max-width: 640px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
             <div style="background-color: #2f9e44; padding: 24px 32px; text-align: center;">
@@ -250,6 +263,8 @@ async function buildDefaultSurveyInviteHtml({ surveyLink, companyId }) {
             </div>
           </div>
         </div>
+</body>
+</html>
       `;
 }
 
