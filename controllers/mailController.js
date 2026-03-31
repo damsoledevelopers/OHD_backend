@@ -83,7 +83,7 @@ async function buildDefaultSurveyInviteHtml({ surveyLink, companyId }) {
           border: 1px solid #d1d5db;
           border-radius: 10px;
         ">
-        <option value="">Select department…</option>
+        <option value="" disabled selected hidden>Select department…</option>
         ${departments
           .map((d) => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`)
           .join('')}
@@ -126,18 +126,19 @@ async function buildDefaultSurveyInviteHtml({ surveyLink, companyId }) {
                   ${hiddenEmployeeEmailInput}
                   ${deptControl}
                   <div style="text-align: center; margin: 8px 0 0 0;">
-                    <button type="submit" style="
-                      display: inline-block;
-                      padding: 12px 32px;
-                      background-color: #2563eb;
-                      color: #ffffff;
-                      border: none;
-                      border-radius: 999px;
-                      font-weight: 600;
-                      font-size: 14px;
-                      cursor: pointer;
-                      font-family: Arial, Helvetica, sans-serif;
-                    ">
+                      <button type="submit" class="start-btn" style="
+                       display: inline-block;
+                       padding: 12px 32px;
+                       background-color: #2563eb;
+                       color: #ffffff;
+                       border: none;
+                       border-radius: 999px;
+                       font-weight: 600;
+                       font-size: 14px;
+                       cursor: pointer;
+                       font-family: Arial, Helvetica, sans-serif;
+                       text-decoration: none;
+                     ">
                       Start exam
                     </button>
                   </div>
@@ -168,16 +169,18 @@ async function buildDefaultSurveyInviteHtml({ surveyLink, companyId }) {
 <html>
 <head>
   <meta charset="utf-8">
-  <style>
-    /* Makes the submit button visually and functionally inactive until the required department field is filled/selected */
-    #ohd-dept-field:invalid ~ div button[type="submit"] {
-      opacity: 0.5 !important;
-      cursor: not-allowed !important;
-      pointer-events: none !important;
-    }
-  </style>
 </head>
 <body style="margin: 0; padding: 0;">
+  <style>
+    /* Inactive button state when department is not selected */
+    #ohd-dept-field:invalid + div .start-btn,
+    [name="department"]:invalid + div .start-btn {
+      opacity: 0.4 !important;
+      cursor: not-allowed !important;
+      pointer-events: none !important;
+      background-color: #94a3b8 !important;
+    }
+  </style>
         <div style="font-family: Arial, sans-serif; background-color: #f6f7fb; padding: 24px;">
           <div style="max-width: 640px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
             <div style="background-color: #2f9e44; padding: 24px 32px; text-align: center;">
