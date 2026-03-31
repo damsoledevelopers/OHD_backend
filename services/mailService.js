@@ -1,5 +1,14 @@
 const nodemailer = require('nodemailer');
 const RECIPIENT_EMAIL_TOKEN = '__RECIPIENT_EMAIL__';
+/** Plain email for HTML attributes (e.g. form hidden fields); not URL-encoded. */
+const RECIPIENT_EMAIL_ATTR_TOKEN = '__RECIPIENT_EMAIL_ATTR__';
+
+function escapeHtmlAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;');
+}
 
 let transporter = null;
 
@@ -41,10 +50,13 @@ async function sendBulkEmail({ subject, html, recipients }) {
 
     const recipient = rawRecipient.trim();
     if (!recipient) continue;
-    const recipientHtml =
-      typeof html === 'string' && html.includes(RECIPIENT_EMAIL_TOKEN)
-        ? html.split(RECIPIENT_EMAIL_TOKEN).join(encodeURIComponent(recipient))
-        : html;
+    let recipientHtml = typeof html === 'string' ? html : '';
+    if (recipientHtml.includes(RECIPIENT_EMAIL_ATTR_TOKEN)) {
+      recipientHtml = recipientHtml.split(RECIPIENT_EMAIL_ATTR_TOKEN).join(escapeHtmlAttr(recipient));
+    }
+    if (recipientHtml.includes(RECIPIENT_EMAIL_TOKEN)) {
+      recipientHtml = recipientHtml.split(RECIPIENT_EMAIL_TOKEN).join(encodeURIComponent(recipient));
+    }
 
     try {
       const info = await transport.sendMail({

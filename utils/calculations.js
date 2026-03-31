@@ -510,10 +510,275 @@ async function calculateOverallStats(companyId, filters = {}, restrictedSectionI
   };
 }
 
+/**
+ * Like `calculateOverallStats`, but also derives per-section stats from the same
+ * loaded `responses` dataset (no repeated EmployeeResponse.find calls).
+ *
+ * @param {string|undefined} companyId
+ * @param {{ department?: string, employeeEmail?: string }} filters
+ * @param {string[]|null} restrictedSectionIds
+ * @returns {Promise<{ overallStats: any, sectionStats: any[] }>}
+ */
+async function calculateOverallStatsWithSectionStats(companyId, filters = {}, restrictedSectionIds = null) {
+  const match = buildResponseMatch(companyId, filters);
+
+  // Pull only what we need and use lean objects for speed/memory.
+  const responses = await EmployeeResponse.find(match)
+    .select('_id companyId answers')
+    .lean();
+
+  const questionPaper = await getPublishedQuestionPaper();
+  const sectionsWithPillars = getAllSections(questionPaper);
+
+  // Per-section stats scope (what the UI expects for the current filters).
+  const sectionsToScore =
+    restrictedSectionIds && restrictedSectionIds.length
+      ? sectionsWithPillars.filter(({ section }) => restrictedSectionIds.includes(section._id.toString()))
+      : sectionsWithPillars;
+
+  const allowedSectionIdSet = new Set(sectionsToScore.map(({ section }) => section._id.toString()));
+
+  // Unique section IDs (used for fast per-response "touched" tracking without Set allocations).
+  const sectionIds = [];
+  const sectionIdToIndex = new Map();
+  for (const { section } of sectionsToScore) {
+    if (!section || !section._id) continue;
+    const sid = section._id.toString();
+    if (!sectionIdToIndex.has(sid)) {
+      sectionIdToIndex.set(sid, sectionIds.length);
+      sectionIds.push(sid);
+    }
+  }
+  const touchedSectionFlags = new Int32Array(sectionIds.length);
+  let visitToken = 1;
+  const touchedSectionIndices = [];
+
+  // Build allowed question IDs from the provided restricted sections (if any).
+  // If question IDs can't be resolved from question paper, we fall back to "no restriction".
+  // This keeps the behavior aligned with the old code's fallbacks.
+  let allowedQ = null;
+  if (restrictedSectionIds && restrictedSectionIds.length) {
+    const idSet = new Set();
+    for (const { section } of sectionsToScore) {
+      if (!section || !Array.isArray(section.questions)) continue;
+      for (const q of section.questions) {
+        if (q && q._id) idSet.add(q._id.toString());
+      }
+    }
+    allowedQ = idSet.size ? idSet : null;
+  }
+
+  // Map questionId -> sectionId only for the sections we will score.
+  // This is used to compute per-section response counts without storing responder IDs.
+  const questionIdToSectionId = new Map();
+  for (const { section } of sectionsToScore) {
+    if (!section || !Array.isArray(section.questions)) continue;
+    const sid = section._id.toString();
+    if (!allowedSectionIdSet.has(sid)) continue;
+    for (const q of section.questions) {
+      if (!q || !q._id) continue;
+      const qid = toQuestionId(q._id);
+      if (!qid) continue;
+      if (!questionIdToSectionId.has(qid)) questionIdToSectionId.set(qid, sid);
+    }
+  }
+
+  // qid -> { ratingCount: {A..E}, totalResponses: number }
+  const byQuestion = new Map();
+  // sectionId -> unique response count that contributed at least one answer in that section
+  const sectionRespondedCounts = new Map();
+
+  let scopedResponseCount = 0; // number of responses that contributed at least one allowed question
+
+  for (const response of responses) {
+    let contributedAny = false;
+
+    for (const answer of response.answers || []) {
+      const qid = toQuestionId(answer.questionId);
+      if (!qid) continue;
+      if (allowedQ && !allowedQ.has(qid)) continue;
+      if (!VALID_RATINGS.has(answer.rating)) continue;
+      contributedAny = true;
+
+      const entry = byQuestion.get(qid) || {
+        ratingCount: makeEmptyRatingCount(),
+        totalResponses: 0,
+      };
+
+      entry.ratingCount[answer.rating] += 1;
+      entry.totalResponses += 1;
+      byQuestion.set(qid, entry);
+
+      const sid = questionIdToSectionId.get(qid);
+      if (sid) {
+        const idx = sectionIdToIndex.get(sid);
+        if (idx !== undefined) {
+          // Mark that this response touched the section (unique per response).
+          if (touchedSectionFlags[idx] !== visitToken) {
+            touchedSectionFlags[idx] = visitToken;
+            touchedSectionIndices.push(idx);
+          }
+        }
+      }
+    }
+
+    if (contributedAny) scopedResponseCount += 1;
+    for (const idx of touchedSectionIndices) {
+      const sid = sectionIds[idx];
+      sectionRespondedCounts.set(sid, (sectionRespondedCounts.get(sid) || 0) + 1);
+    }
+
+    touchedSectionIndices.length = 0;
+    visitToken += 1;
+    if (visitToken === 2147483647) {
+      // Prevent Int32 overflow; reset flags.
+      touchedSectionFlags.fill(0);
+      visitToken = 1;
+    }
+  }
+
+  // Overall rating distribution
+  const ratingCount = makeEmptyRatingCount();
+  byQuestion.forEach((entry) => {
+    ratingCount.A += entry.ratingCount.A;
+    ratingCount.B += entry.ratingCount.B;
+    ratingCount.C += entry.ratingCount.C;
+    ratingCount.D += entry.ratingCount.D;
+    ratingCount.E += entry.ratingCount.E;
+  });
+
+  const totalRatings = Object.values(ratingCount).reduce((a, b) => a + b, 0);
+  const ratingDistributionPercentage = {
+    A: totalRatings > 0 ? (ratingCount.A / totalRatings) * 100 : 0,
+    B: totalRatings > 0 ? (ratingCount.B / totalRatings) * 100 : 0,
+    C: totalRatings > 0 ? (ratingCount.C / totalRatings) * 100 : 0,
+    D: totalRatings > 0 ? (ratingCount.D / totalRatings) * 100 : 0,
+    E: totalRatings > 0 ? (ratingCount.E / totalRatings) * 100 : 0,
+  };
+
+  // Overall percentage (weighted score)
+  let totalScore = 0;
+  let totalMaxScore = 0;
+  byQuestion.forEach((entry) => {
+    totalScore +=
+      entry.ratingCount.A * 5 +
+      entry.ratingCount.B * 4 +
+      entry.ratingCount.C * 3 +
+      entry.ratingCount.D * 2 +
+      entry.ratingCount.E * 1;
+    totalMaxScore +=
+      (entry.ratingCount.A + entry.ratingCount.B + entry.ratingCount.C + entry.ratingCount.D + entry.ratingCount.E) * 5;
+  });
+
+  const overallPercentage = totalMaxScore > 0 ? (totalScore / totalMaxScore) * 100 : 0;
+
+  const benchmark = getOriBenchmark(overallPercentage);
+  const summaryInsights = [];
+  summaryInsights.push(`ORI Benchmark: ${benchmark.healthStatus} (${benchmark.colorCode})`);
+
+  const uniqueCompanies = companyId ? 1 : new Set(responses.map((r) => r.companyId?.toString?.() || String(r.companyId))).size;
+
+  const overallStats = {
+    overallPercentage,
+    ratingDistribution: ratingCount,
+    ratingDistributionPercentage,
+    bestSection: null,
+    totalResponses: scopedResponseCount,
+    totalCompanies: uniqueCompanies,
+    summaryInsights,
+    benchmark,
+  };
+
+  // Build section stats (and best section) fully in-memory.
+  let bestSection = null;
+  let bestPercentage = 0;
+  const sectionStats = [];
+
+  for (const { section } of sectionsToScore) {
+    if (!section || !Array.isArray(section.questions)) {
+      sectionStats.push({
+        sectionId: section && section._id ? section._id.toString() : '',
+        sectionName: section && section.name ? section.name : '',
+        questionStats: [],
+        sectionPercentage: 0,
+        totalResponses: 0,
+      });
+      continue;
+    }
+
+    const questions = [...section.questions].sort((a, b) => {
+      const ao = typeof a.order === 'number' ? a.order : 0;
+      const bo = typeof b.order === 'number' ? b.order : 0;
+      return ao - bo;
+    });
+
+    let weightedScore = 0;
+    let totalMaxScore = 0;
+
+    const questionStats = [];
+
+    for (const question of questions) {
+      const qid = toQuestionId(question._id);
+      const entry = byQuestion.get(qid);
+
+      const qTotal = entry ? entry.totalResponses : 0;
+      const rc = entry ? entry.ratingCount : makeEmptyRatingCount();
+
+      if (qTotal > 0) {
+        weightedScore += rc.A * 5 + rc.B * 4 + rc.C * 3 + rc.D * 2 + rc.E * 1;
+        totalMaxScore += qTotal * 5;
+      }
+
+      const ratingPercentage = {
+        A: qTotal > 0 ? (rc.A / qTotal) * 100 : 0,
+        B: qTotal > 0 ? (rc.B / qTotal) * 100 : 0,
+        C: qTotal > 0 ? (rc.C / qTotal) * 100 : 0,
+        D: qTotal > 0 ? (rc.D / qTotal) * 100 : 0,
+        E: qTotal > 0 ? (rc.E / qTotal) * 100 : 0,
+      };
+
+      questionStats.push({
+        questionId: qid,
+        questionText: question && question.text ? question.text : '',
+        ratingCount: { ...rc },
+        ratingPercentage,
+        totalResponses: qTotal,
+      });
+    }
+
+    const sectionPercentage = totalMaxScore > 0 ? (weightedScore / totalMaxScore) * 100 : 0;
+    const totalResponses = sectionRespondedCounts.get(section._id.toString()) || 0;
+
+    const secStat = {
+      sectionId: section._id.toString(),
+      sectionName: section && section.name ? section.name : '',
+      questionStats,
+      sectionPercentage,
+      totalResponses,
+    };
+
+    sectionStats.push(secStat);
+
+    if (sectionPercentage > bestPercentage) {
+      bestPercentage = sectionPercentage;
+      bestSection = {
+        sectionId: secStat.sectionId,
+        sectionName: secStat.sectionName,
+        percentage: sectionPercentage,
+      };
+    }
+  }
+
+  overallStats.bestSection = bestSection;
+
+  return { overallStats, sectionStats };
+}
+
 module.exports = {
   calculateQuestionStats,
   calculateSectionStats,
   calculateOverallStats,
+  calculateOverallStatsWithSectionStats,
   buildFallbackSectionStats,
   buildResponseMatch,
   getAllSections,

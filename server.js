@@ -15,6 +15,7 @@ const mailRoutes = require('./routes/mail');
 const { sendCompanyFormLink } = require('./controllers/mailController');
 const { requireAdmin } = require('./middleware/auth');
 const publicRoutes = require('./routes/public');
+const departmentRoutes = require('./routes/departments');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -82,6 +83,7 @@ async function startServer() {
 
 // Routes
 app.use('/api/public', publicRoutes);
+app.use('/api/departments', departmentRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/companies', companyRoutes);
 app.use('/api/responses', responseRoutes);

@@ -1,14 +1,27 @@
 const Company = require('../models/Company');
 const EmployeeResponse = require('../models/EmployeeResponse');
+const ExamStartLock = require('../models/ExamStartLock');
 const connectDB = require('../config/database');
 const cloudinary = require('../config/cloudinary');
 const axios = require('axios');
 const XLSX = require('xlsx');
 
-const SURVEY_START_ACTIVE_MINUTES = Math.max(
-  0,
-  Number(process.env.SURVEY_START_ACTIVE_MINUTES) || 60,
+/** Hours after dispatch that the invite link / Start exam stay valid when `surveyClosesAt` is not set (legacy rows). */
+const SURVEY_INVITE_START_WINDOW_HOURS = Math.max(
+  1,
+  Number(process.env.SURVEY_INVITE_START_WINDOW_HOURS) || 24,
 );
+
+function getSurveyInviteStartWindowEnd(companyLike) {
+  if (!companyLike || !companyLike.surveyDispatchedAt) return null;
+  if (companyLike.surveyClosesAt) {
+    return new Date(companyLike.surveyClosesAt);
+  }
+  return new Date(
+    new Date(companyLike.surveyDispatchedAt).getTime() +
+      SURVEY_INVITE_START_WINDOW_HOURS * 60 * 60 * 1000,
+  );
+}
 
 function parseDepartments(rawDepartments) {
   if (rawDepartments === undefined) return undefined;
@@ -33,7 +46,24 @@ function parseDepartments(rawDepartments) {
 async function getCompanies(req, res) {
   try {
     await connectDB();
-    const companies = await Company.find().sort({ createdAt: -1 });
+
+    const pageRaw = req.query?.page;
+    const limitRaw = req.query?.limit;
+    const pageNum = pageRaw !== undefined ? Number(pageRaw) : null;
+    const limitNum = limitRaw !== undefined ? Number(limitRaw) : null;
+    const usePagination = Number.isFinite(pageNum) && Number.isFinite(limitNum);
+
+    const total = usePagination ? await Company.countDocuments({}) : undefined;
+
+    const limitSafe = usePagination ? Math.max(1, Math.min(100, limitNum)) : undefined;
+    const pageSafe = usePagination ? Math.max(1, pageNum) : undefined;
+
+    let companiesQuery = Company.find().sort({ createdAt: -1 });
+    if (usePagination) {
+      companiesQuery = companiesQuery.skip((pageSafe - 1) * limitSafe).limit(limitSafe);
+    }
+
+    const companies = await companiesQuery;
 
     const now = new Date();
     for (const company of companies) {
@@ -51,6 +81,15 @@ async function getCompanies(req, res) {
         if (company.status !== 'session_ended') company.status = 'completed';
         await company.save();
       }
+    }
+
+    if (usePagination) {
+      return res.json({
+        companies,
+        total,
+        page: pageSafe,
+        limit: limitSafe,
+      });
     }
 
     return res.json({ companies });
@@ -158,13 +197,19 @@ async function getPublicCompanyById(req, res) {
     }
 
     const companyObj = company.toObject();
-    if (companyObj.surveyDispatchedAt) {
-      companyObj.surveyStartClosesAt = new Date(
-        new Date(companyObj.surveyDispatchedAt).getTime() +
-          SURVEY_START_ACTIVE_MINUTES * 60 * 1000,
-      );
-    } else {
-      companyObj.surveyStartClosesAt = null;
+    const startWindowEnd = getSurveyInviteStartWindowEnd(companyObj);
+    companyObj.surveyStartClosesAt = startWindowEnd;
+
+    const normalizedEmail = String(req.query?.employeeEmail || '').trim().toLowerCase();
+    const hasValidEmail = normalizedEmail.includes('@') && normalizedEmail.includes('.');
+    companyObj.hasStartedExam = false;
+    if (hasValidEmail && companyObj.surveyDispatchedAt) {
+      const existingLock = await ExamStartLock.findOne({
+        companyId: company._id,
+        employeeEmail: normalizedEmail,
+        surveyDispatchedAt: companyObj.surveyDispatchedAt,
+      }).select('_id');
+      companyObj.hasStartedExam = Boolean(existingLock);
     }
 
     return res.json({ company: companyObj });
@@ -292,7 +337,13 @@ async function publicCreateCompany(req, res) {
 
     return res.status(201).json({ company });
   } catch (error) {
-    return res.status(500).json({ error: error.message || 'Failed to submit company details' });
+    // Common case: duplicate email violates unique index.
+    if (error && typeof error === 'object' && error.code === 11000) {
+      return res.status(409).json({ error: 'A company with this email already exists' });
+    }
+    return res
+      .status(500)
+      .json({ error: error?.message || 'Failed to submit company details' });
   }
 }
 
@@ -352,9 +403,8 @@ async function maybeFinalizeByStartWindow(company, now) {
   // Only finalize once: when the portal status is currently "active".
   if (company.status !== 'active' && company.status !== 'pending') return;
 
-  const startClosesAt = new Date(company.surveyDispatchedAt.getTime() + SURVEY_START_ACTIVE_MINUTES * 60 * 1000);
-
-  if (now <= startClosesAt) return;
+  const startClosesAt = getSurveyInviteStartWindowEnd(company);
+  if (!startClosesAt || now <= startClosesAt) return;
 
   // Decide final admin status based on whether all invited users have submitted.
   // This intentionally does NOT modify `surveyStatus` (which gates submissions).

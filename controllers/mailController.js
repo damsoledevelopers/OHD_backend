@@ -3,10 +3,14 @@ const connectDB = require('../config/database');
 const MailLog = require('../models/MailLog');
 const Company = require('../models/Company');
 
-const SURVEY_START_ACTIVE_MINUTES = Math.max(
-  0,
-  Number(process.env.SURVEY_START_ACTIVE_MINUTES) || 60,
+/** How long the emailed link and Start exam button remain valid (matches `surveyClosesAt` set on dispatch). */
+const SURVEY_INVITE_START_WINDOW_HOURS = Math.max(
+  1,
+  Number(process.env.SURVEY_INVITE_START_WINDOW_HOURS) || 24,
 );
+
+const inviteHoursLabel =
+  SURVEY_INVITE_START_WINDOW_HOURS === 1 ? '1 hour' : `${SURVEY_INVITE_START_WINDOW_HOURS} hours`;
 
 /** Once started, participant must complete the exam within this many minutes. */
 const SURVEY_EXAM_DURATION_MINUTES = Math.max(
@@ -14,20 +18,153 @@ const SURVEY_EXAM_DURATION_MINUTES = Math.max(
   Number(process.env.SURVEY_EXAM_DURATION_MINUTES) || 30,
 );
 
-exports.sendBulk = async (req, res, next) => {
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function trimBaseUrl(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw.trim().replace(/\/$/, '');
+}
+
+/**
+ * Default invite: HTML form with department field + GET submit to the configured survey/question-paper URL.
+ * (Some mail clients strip forms — fallback link included.)
+ */
+async function buildDefaultSurveyInviteHtml({ surveyLink, companyId }) {
+  let surveyActionUrl = '';
+  let resolvedCompanyId = typeof companyId === 'string' && companyId.trim() ? companyId.trim() : '';
+
   try {
-    await connectDB();
-
-    const { subject, html, recipients, companyId, notes, surveyLink } = req.body || {};
-
-    // Allow either explicit HTML from client or at least a survey link to build HTML
-    if (!subject || (!html && !surveyLink)) {
-      return res.status(400).json({ error: 'Subject and survey link are required' });
+    const forParse = String(surveyLink || '').replace(/__RECIPIENT_EMAIL__/g, 'recipient@example.com');
+    const u = new URL(forParse);
+    surveyActionUrl = u.toString();
+    const qCid = u.searchParams.get('companyId');
+    if (qCid) resolvedCompanyId = qCid;
+  } catch {
+    const base = trimBaseUrl(process.env.PUBLIC_APP_BASE_URL || '');
+    if (base) {
+      try {
+        const withProto = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(base) ? base : `http://${base}`;
+        surveyActionUrl = new URL('/survey', `${withProto}/`).toString();
+      } catch {
+        surveyActionUrl = '';
+      }
     }
+  }
 
-    const finalHtml =
-      html ||
-      `
+  let departments = [];
+  if (resolvedCompanyId) {
+    try {
+      const c = await Company.findById(resolvedCompanyId).select('departments').lean();
+      if (c && Array.isArray(c.departments)) {
+        departments = c.departments.map((d) => String(d).trim()).filter(Boolean);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const deptFieldId = 'ohd-dept-field';
+  const deptControl = departments.length
+    ? `<select name="department" required id="${deptFieldId}" style="
+          width: 100%;
+          max-width: 100%;
+          box-sizing: border-box;
+          padding: 12px 14px;
+          margin: 0 0 16px 0;
+          font-size: 14px;
+          color: #1f2937;
+          background-color: #ffffff;
+          border: 1px solid #d1d5db;
+          border-radius: 10px;
+        ">
+        <option value="">Select department…</option>
+        ${departments
+          .map((d) => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`)
+          .join('')}
+      </select>`
+    : `<input
+        type="text"
+        name="department"
+        required
+        id="${deptFieldId}"
+        placeholder="Enter your department"
+        style="
+          width: 100%;
+          max-width: 100%;
+          box-sizing: border-box;
+          padding: 12px 14px;
+          margin: 0 0 16px 0;
+          font-size: 14px;
+          color: #1f2937;
+          border: 1px solid #d1d5db;
+          border-radius: 10px;
+        "
+      />`;
+
+  const hiddenCompanyIdInput = resolvedCompanyId
+    ? `<input type="hidden" name="companyId" value="${escapeHtml(resolvedCompanyId)}" />`
+    : '';
+  const hiddenEmployeeEmailInput = `<input type="hidden" name="employeeEmail" value="__RECIPIENT_EMAIL_ATTR__" />`;
+
+  const formBlock =
+    surveyActionUrl
+      ? `
+              <div style="margin: 0 0 8px 0;">
+                <label for="${deptFieldId}" style="display: block; margin: 0 0 8px 0; font-size: 14px; font-weight: 600; color: #374151;">
+                  Department
+                </label>
+                <form action="${escapeHtml(
+                  surveyActionUrl.replace(/__RECIPIENT_EMAIL__/g, '__RECIPIENT_EMAIL_ATTR__'),
+                )}" method="get" target="_blank" style="margin: 0; text-align: left;">
+                  ${hiddenCompanyIdInput}
+                  ${hiddenEmployeeEmailInput}
+                  ${deptControl}
+                  <div style="text-align: center; margin: 8px 0 0 0;">
+                    <button type="submit" style="
+                      display: inline-block;
+                      padding: 12px 32px;
+                      background-color: #2563eb;
+                      color: #ffffff;
+                      border: none;
+                      border-radius: 999px;
+                      font-weight: 600;
+                      font-size: 14px;
+                      cursor: pointer;
+                      font-family: Arial, Helvetica, sans-serif;
+                    ">
+                      Start exam
+                    </button>
+                  </div>
+                </form>
+              </div>`
+      : `
+              <div style="text-align: center; margin: 24px 0;">
+                <a
+                  href="${surveyLink}"
+                  style="
+                    display: inline-block;
+                    padding: 12px 32px;
+                    background-color: #2563eb;
+                    color: #ffffff;
+                    border-radius: 999px;
+                    font-weight: 600;
+                    font-size: 14px;
+                    text-decoration: none;
+                  "
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Start exam
+                </a>
+              </div>`;
+
+  return `
         <div style="font-family: Arial, sans-serif; background-color: #f6f7fb; padding: 24px;">
           <div style="max-width: 640px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.06);">
             <div style="background-color: #2f9e44; padding: 24px 32px; text-align: center;">
@@ -69,11 +206,11 @@ exports.sendBulk = async (req, res, next) => {
                 </li>
                 <li style="margin-bottom: 6px;">
                   <strong>You must finish the exam within ${SURVEY_EXAM_DURATION_MINUTES} minutes.</strong>
-                  The timer starts once your exam questions have loaded (after you click “Start exam” in the survey); submit before time runs out.
+                  The timer starts once your exam questions have loaded (after you click “Start exam”); submit before time runs out.
                 </li>
                 <li style="margin-bottom: 6px;">
-                  <strong>The email link and Start button are valid for ${SURVEY_START_ACTIVE_MINUTES} minutes</strong>
-                  from when this email was sent. Please open the link and click “Start” within that window.
+                  <strong>The email link and Start button are valid for ${inviteHoursLabel}</strong>
+                  from when this email was sent. Please use the form below within that window.
                 </li>
                 <li style="margin-bottom: 6px;">
                   <strong>There is no time restriction per question.</strong>
@@ -94,31 +231,14 @@ exports.sendBulk = async (req, res, next) => {
               </ol>
 
               <p style="margin: 0 0 16px;">
-                When you are ready, please click the button below. It opens a secure page where you can start the exam: the Start button stays available for ${SURVEY_START_ACTIVE_MINUTES} minutes from dispatch, and after you start you have ${SURVEY_EXAM_DURATION_MINUTES} minutes to finish.
+                When you are ready, select your <strong>department</strong> below, then click <strong>Start exam</strong>.
+                Your browser will open the question paper directly. The Start button stays available for ${inviteHoursLabel} from dispatch, and after you start you have ${SURVEY_EXAM_DURATION_MINUTES} minutes to finish.
               </p>
 
-              <div style="text-align: center; margin: 24px 0;">
-                <a
-                  href="${surveyLink}"
-                  style="
-                    display: inline-block;
-                    padding: 12px 32px;
-                    background-color: #2563eb;
-                    color: #ffffff;
-                    border-radius: 999px;
-                    font-weight: 600;
-                    font-size: 14px;
-                    text-decoration: none;
-                  "
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  Start exam
-                </a>
-              </div>
+              ${formBlock}
 
-              <p style="margin: 0 0 8px; font-size: 12px; color: #6b7280;">
-                If the button doesn't work, copy and paste this link into your browser:
+              <p style="margin: 16px 0 8px; font-size: 12px; color: #6b7280;">
+                If the form does not work in your email app, open this link instead (you will choose department on the next page):
               </p>
               <p style="margin: 0 0 16px; font-size: 12px; color: #1d4ed8; word-break: break-all;">
                 <a href="${surveyLink}" target="_blank" rel="noopener noreferrer">${surveyLink}</a>
@@ -131,6 +251,20 @@ exports.sendBulk = async (req, res, next) => {
           </div>
         </div>
       `;
+}
+
+exports.sendBulk = async (req, res, next) => {
+  try {
+    await connectDB();
+
+    const { subject, html, recipients, companyId, notes, surveyLink } = req.body || {};
+
+    // Allow either explicit HTML from client or at least a survey link to build HTML
+    if (!subject || (!html && !surveyLink)) {
+      return res.status(400).json({ error: 'Subject and survey link are required' });
+    }
+
+    const finalHtml = html || (await buildDefaultSurveyInviteHtml({ surveyLink, companyId }));
 
     // Normalize and validate recipients to ensure each email is well-formed
     const normalizedRecipients = Array.isArray(recipients)
@@ -168,7 +302,9 @@ exports.sendBulk = async (req, res, next) => {
     // If a company is associated with this bulk send, mark survey as dispatched
     if (companyId) {
       const dispatchedAt = new Date();
-      const closesAt = new Date(dispatchedAt.getTime() + 24 * 60 * 60 * 1000);
+      const closesAt = new Date(
+        dispatchedAt.getTime() + SURVEY_INVITE_START_WINDOW_HOURS * 60 * 60 * 1000,
+      );
       await Company.findByIdAndUpdate(
         companyId,
         {
@@ -199,11 +335,6 @@ exports.sendBulk = async (req, res, next) => {
     return res.status(500).json({ error: error.message || 'Failed to send emails' });
   }
 };
-
-function trimBaseUrl(raw) {
-  if (!raw || typeof raw !== 'string') return '';
-  return raw.trim().replace(/\/$/, '');
-}
 
 function buildCompanyFormUrl() {
   const base = trimBaseUrl(process.env.PUBLIC_APP_BASE_URL);
@@ -329,14 +460,6 @@ exports.sendCompanyFormLink = async (req, res, next) => {
     return res.status(500).json({ error: error.message || 'Failed to send email' });
   }
 };
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
 
 exports.getLogs = async (req, res, next) => {
   try {

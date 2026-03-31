@@ -5,7 +5,26 @@ const {
   buildFallbackSectionStats,
   getPublishedQuestionPaper,
   getAllSections,
+  calculateOverallStatsWithSectionStats,
 } = require('../utils/calculations');
+
+// Simple in-memory cache for expensive diagnostic computations.
+// This is especially important because `/api/reports/overall` is called
+// immediately when the report page opens.
+const overallReportCache = new Map();
+const OVERALL_REPORT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function getOverallCacheKey(params) {
+  const { companyId, department, employeeEmail, sectionId, pillarId } = params;
+  return [
+    'overall',
+    companyId || '',
+    department || '',
+    employeeEmail || '',
+    sectionId || '',
+    pillarId || '',
+  ].join('|');
+}
 
 function sectionIdsForPillar(questionPaper, pillarId) {
   if (!questionPaper || !pillarId || !Array.isArray(questionPaper.pillars)) return [];
@@ -45,7 +64,6 @@ async function getCompanyReport(req, res) {
       }
     }
 
-    const overallStats = await calculateOverallStats(companyId, filters, restrictedSectionIds);
     const sectionsWithPillars = getAllSections(questionPaper);
 
     let toIterate = sectionsWithPillars;
@@ -55,14 +73,11 @@ async function getCompanyReport(req, res) {
       );
     }
 
+    const { overallStats, sectionStats: computedSectionStats } =
+      await calculateOverallStatsWithSectionStats(companyId, filters, restrictedSectionIds);
+
     let sectionStats =
-      toIterate.length === 0
-        ? await buildFallbackSectionStats(companyId, filters, restrictedSectionIds)
-        : await Promise.all(
-            toIterate.map(({ section }) =>
-              calculateSectionStats(section._id.toString(), companyId, filters)
-            )
-          );
+      toIterate.length === 0 ? await buildFallbackSectionStats(companyId, filters, restrictedSectionIds) : computedSectionStats;
 
     if (
       toIterate.length > 0 &&
@@ -107,12 +122,25 @@ async function getSectionReport(req, res) {
 
 async function getOverallReport(req, res) {
   try {
-    await connectDB();
-
     const { companyId, department, employeeEmail, sectionId, pillarId } = req.query;
     const filters = {};
     if (department) filters.department = String(department).trim();
     if (employeeEmail) filters.employeeEmail = String(employeeEmail).trim().toLowerCase();
+
+    const cacheKey = getOverallCacheKey({
+      companyId: companyId ? String(companyId) : '',
+      department: filters.department || '',
+      employeeEmail: filters.employeeEmail || '',
+      sectionId: sectionId ? String(sectionId) : '',
+      pillarId: pillarId ? String(pillarId) : '',
+    });
+
+    const cached = overallReportCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json(cached.data);
+    }
+
+    await connectDB();
 
     const questionPaper = await getPublishedQuestionPaper();
     const sectionsWithPillars = getAllSections(questionPaper);
@@ -125,11 +153,8 @@ async function getOverallReport(req, res) {
       if (restrictedSectionIds.length === 0) restrictedSectionIds = null;
     }
 
-    const overallStats = await calculateOverallStats(
-      companyId || undefined,
-      filters,
-      restrictedSectionIds
-    );
+    const { overallStats, sectionStats: computedSectionStats } =
+      await calculateOverallStatsWithSectionStats(companyId || undefined, filters, restrictedSectionIds);
 
     let toIterate = sectionsWithPillars;
     if (restrictedSectionIds && restrictedSectionIds.length) {
@@ -141,11 +166,7 @@ async function getOverallReport(req, res) {
     let sectionStats =
       toIterate.length === 0
         ? await buildFallbackSectionStats(companyId || undefined, filters, restrictedSectionIds)
-        : await Promise.all(
-            toIterate.map(({ section }) =>
-              calculateSectionStats(section._id.toString(), companyId || undefined, filters)
-            )
-          );
+        : computedSectionStats;
 
     if (
       toIterate.length > 0 &&
@@ -159,10 +180,13 @@ async function getOverallReport(req, res) {
       );
     }
 
-    return res.json({
-      overallStats,
-      sectionStats,
-    });
+    const payload = { overallStats, sectionStats };
+
+    // Best-effort cache store (avoid growing unbounded).
+    overallReportCache.set(cacheKey, { expiresAt: Date.now() + OVERALL_REPORT_CACHE_TTL_MS, data: payload });
+    if (overallReportCache.size > 500) overallReportCache.clear();
+
+    return res.json(payload);
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to generate overall report' });
   }

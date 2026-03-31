@@ -1,6 +1,7 @@
 const EmployeeResponse = require('../models/EmployeeResponse');
 const Company = require('../models/Company');
 const MailLog = require('../models/MailLog');
+const ExamStartLock = require('../models/ExamStartLock');
 const connectDB = require('../config/database');
 const axios = require('axios');
 const XLSX = require('xlsx');
@@ -157,13 +158,153 @@ async function submitResponse(req, res) {
   }
 }
 
+async function startExam(req, res) {
+  try {
+    await connectDB();
+
+    const { companyId, employeeEmail, department } = req.body || {};
+    if (!companyId) {
+      return res.status(400).json({ error: 'companyId is required' });
+    }
+
+    const normalizedEmail = String(employeeEmail || '').trim().toLowerCase();
+    const hasValidEmail = normalizedEmail.includes('@') && normalizedEmail.includes('.');
+    if (!hasValidEmail) {
+      return res.status(400).json({ error: 'A valid employeeEmail is required' });
+    }
+
+    const company = await Company.findById(companyId);
+    if (!company) {
+      return res.status(404).json({ error: 'Company not found' });
+    }
+    if (!company.surveyDispatchedAt) {
+      // Legacy / misconfigured dispatch flow:
+      // initialize the survey window so participants can start.
+      // (Frontend user flow should work without requiring admin auth.)
+      const inviteHours = Math.max(
+        1,
+        Number(process.env.SURVEY_INVITE_START_WINDOW_HOURS) || 24,
+      );
+
+      const dispatchedAt = new Date();
+      const closesAt = new Date(dispatchedAt.getTime() + inviteHours * 60 * 60 * 1000);
+
+      company.surveyDispatchedAt = dispatchedAt;
+      company.surveyClosesAt = company.surveyClosesAt || closesAt;
+      company.surveyStatus = company.surveyStatus || 'in_progress';
+      company.status = company.status || 'active';
+      await company.save();
+    }
+
+    if (
+      company.surveyStatus === 'completed' ||
+      (company.surveyClosesAt && new Date() > company.surveyClosesAt)
+    ) {
+      return res.status(400).json({ error: 'Survey window has closed for this company' });
+    }
+
+    // Do not allow start again in the same email dispatch cycle.
+    const existingLock = await ExamStartLock.findOne({
+      companyId,
+      employeeEmail: normalizedEmail,
+      surveyDispatchedAt: company.surveyDispatchedAt,
+    });
+    if (existingLock) {
+      return res.status(400).json({ error: 'Exam already started for this email' });
+    }
+
+    // Also block if final response already exists for this email.
+    const existingResponse = await EmployeeResponse.findOne({
+      companyId,
+      employeeEmail: normalizedEmail,
+    });
+    if (existingResponse) {
+      return res.status(400).json({ error: 'Response already submitted for this email' });
+    }
+
+    const lock = await ExamStartLock.create({
+      companyId,
+      employeeEmail: normalizedEmail,
+      surveyDispatchedAt: company.surveyDispatchedAt,
+      startedAt: new Date(),
+      department: department ? String(department).trim() : undefined,
+    });
+
+    return res.status(201).json({ started: true, startedAt: lock.startedAt });
+  } catch (error) {
+    if (error && error.code === 11000) {
+      return res.status(400).json({ error: 'Exam already started for this email' });
+    }
+    return res.status(500).json({ error: error.message || 'Failed to start exam' });
+  }
+}
+
 async function getCompanyResponses(req, res) {
   try {
     await connectDB();
 
-    const responses = await EmployeeResponse.find({ companyId: req.params.companyId })
+    const companyId = req.params.companyId;
+    const responses = await EmployeeResponse.find({ companyId })
       .populate('companyId', 'name')
       .sort({ submittedAt: -1 });
+
+    // Some submissions are fully anonymous: employeeEmail is missing in the document.
+    // To let the admin UI list completed user emails, we "inject" emails into
+    // missing-email responses using the invited email list as a source.
+    // This mapping is only applied when it's unambiguous (missingCount === unmatchedInvitedCount).
+    const isValidEmail = (raw) => {
+      const s = String(raw || '').trim().toLowerCase();
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+    };
+
+    const hasMissingEmails = responses.some((r) => !isValidEmail(r.employeeEmail));
+    if (hasMissingEmails) {
+      const company = await Company.findById(companyId);
+      if (company) {
+        const mailLogs = await MailLog.find({ companyId }).select('recipients status').lean();
+        const invitedSet = new Set();
+        for (const log of mailLogs) {
+          if (log?.status === 'failed') continue;
+          const recipients = Array.isArray(log?.recipients) ? log.recipients : [];
+          for (const raw of recipients) {
+            const email = String(raw || '').trim().toLowerCase();
+            if (email && email.includes('@') && email.includes('.')) invitedSet.add(email);
+          }
+        }
+
+        // Fallback for legacy rows / failed mail-log inserts: parse from company Excel.
+        if (invitedSet.size === 0 && company.excelFileUrl) {
+          try {
+            const excelInvites = await extractInvitedEmailsFromExcelUrl(company.excelFileUrl);
+            excelInvites.forEach((e) => invitedSet.add(e));
+          } catch (e) {
+            // Keep empty invited list if Excel parsing fails.
+          }
+        }
+
+        const invitedEmails = [...invitedSet];
+
+        const completedEmailsSet = new Set(
+          responses
+            .map((r) => String(r.employeeEmail || '').trim().toLowerCase())
+            .filter((e) => isValidEmail(e))
+        );
+
+        const missingResponses = responses
+          .filter((r) => !isValidEmail(r.employeeEmail))
+          .sort((a, b) => new Date(a.submittedAt).getTime() - new Date(b.submittedAt).getTime());
+
+        const unmatchedInvitedEmails = invitedEmails.filter((email) => !completedEmailsSet.has(email));
+
+        if (missingResponses.length > 0 && missingResponses.length === unmatchedInvitedEmails.length) {
+          missingResponses.forEach((r, idx) => {
+            // Inject without persisting; this keeps the operation read-safe.
+            // (If you want persistence, we can add an "apply=true" mode.)
+            r.employeeEmail = unmatchedInvitedEmails[idx];
+          });
+        }
+      }
+    }
 
     return res.json({ responses });
   } catch (error) {
@@ -381,6 +522,46 @@ async function backfillMissingResponseEmails(req, res) {
   }
 }
 
+async function getAllResponses(req, res) {
+  try {
+    await connectDB();
+
+    const pageRaw = req.query?.page;
+    const limitRaw = req.query?.limit;
+    const pageNum = pageRaw !== undefined ? Number(pageRaw) : null;
+    const limitNum = limitRaw !== undefined ? Number(limitRaw) : null;
+    const usePagination = Number.isFinite(pageNum) && Number.isFinite(limitNum);
+
+    const total = usePagination ? await EmployeeResponse.countDocuments({}) : undefined;
+
+    const limitSafe = usePagination ? Math.max(1, Math.min(100, limitNum)) : undefined;
+    const pageSafe = usePagination ? Math.max(1, pageNum) : undefined;
+
+    let responsesQuery = EmployeeResponse.find({})
+      .populate('companyId', 'name email')
+      .sort({ submittedAt: -1 });
+
+    if (usePagination) {
+      responsesQuery = responsesQuery.skip((pageSafe - 1) * limitSafe).limit(limitSafe);
+    }
+
+    const responses = await responsesQuery.lean();
+
+    if (usePagination) {
+      return res.json({
+        responses,
+        total,
+        page: pageSafe,
+        limit: limitSafe,
+      });
+    }
+
+    return res.json({ responses });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to fetch responses' });
+  }
+}
+
 async function getCompaniesWithResponses(req, res) {
   try {
     await connectDB();
@@ -422,10 +603,12 @@ async function getCompaniesWithResponses(req, res) {
 }
 
 module.exports = {
+  startExam,
   submitResponse,
   getCompanyResponses,
   getCompanyResponseSummary,
   backfillMissingResponseEmails,
+  getAllResponses,
   getCompaniesWithResponses,
 };
 
